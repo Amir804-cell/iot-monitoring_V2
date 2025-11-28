@@ -1,0 +1,14 @@
+# Minimal Doxygen configuration for edge firmware
+
+PROJECT_NAME           = "ESP32 DV10 Firmware"
+OUTPUT_DIRECTORY       = docs
+GENERATE_LATEX         = NO
+GENERATE_HTML          = YES
+QUIET                  = NO
+INPUT                  = src/main.cpp
+FILE_PATTERNS          = *.cpp *.h
+RECURSIVE              = NO
+EXTRACT_ALL            = YES
+OPTIMIZE_OUTPUT_FOR_C  = YES
+JAVADOC_AUTOBRIEF      = YES
+WARN_IF_UNDOCUMENTED   = NO
