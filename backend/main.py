@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import psycopg2
 from pydantic import BaseModel
 from datetime import datetime
+from contextlib import contextmanager
 
 app = FastAPI()
 
@@ -14,20 +15,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# =======================
-# DATABASE CONNECTION
-# =======================
-
-# >>> CHANGE HERE if your QuestDB credentials differ
-conn = psycopg2.connect(
-    dbname="qdb",
-    user="admin",
-    password="quest",
-    host="localhost",   # Debian host, not container name
-    port=8812           # QuestDB Postgres port
-)
-cur = conn.cursor()
 
 # =======================
 # METRIC DEFINITIONS
@@ -65,6 +52,49 @@ class DataQuery(BaseModel):
 
 
 # =======================
+# DATABASE CONNECTION HELPER (Refactored for testability)
+# =======================
+
+@contextmanager
+def get_db_cursor():
+    """
+    Establishes a connection to QuestDB, yields the cursor, and handles
+    connection closing and error reporting. This function is now the single
+    point of connection and is easily mockable.
+    """
+    conn = None
+    cur = None
+    try:
+        # >>> CHANGE HERE if your QuestDB credentials differ
+        conn = psycopg2.connect(
+            dbname="qdb",
+            user="admin",
+            password="quest",
+            host="localhost",    # Debian host, not container name
+            port=8812            # QuestDB Postgres port
+        )
+        cur = conn.cursor()
+        yield cur
+        conn.commit() # Commit transaction if successful (though reads don't strictly need it)
+    except psycopg2.OperationalError as e:
+        # Specifically catch connection failures and raise as 500 HTTPException
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Database connection failed: {str(e)}"
+        )
+    except Exception as e:
+        # General database operation error handling (e.g., query execution failure)
+        if conn:
+            conn.rollback()
+        # Raise generic 500 for other unexpected errors
+        raise HTTPException(status_code=500, detail=f"Database operation failed: {str(e)}")
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+# =======================
 # HELPERS
 # =======================
 
@@ -100,7 +130,7 @@ def row_to_metrics(ts, row_values):
 
 
 # =======================
-# API ENDPOINTS
+# API ENDPOINTS (Updated to use get_db_cursor context manager)
 # =======================
 
 @app.get("/api/devices")
@@ -109,31 +139,19 @@ def get_devices():
     Return list of device_ids from olimex_data
     -> { "devices": ["OLIMEX_POE", ...] }
     """
-    try:
+    # Using the context manager to automatically open/close the connection
+    with get_db_cursor() as cur:
         cur.execute("SELECT DISTINCT device_id FROM olimex_data;")
         devices = [row[0] for row in cur.fetchall()]
         return {"devices": devices}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/data/latest/{device_id}")
 def get_latest_data(device_id: str):
     """
     Return the latest row for a device, converted to a list of metrics.
-
-    Shape (what frontend expects):
-
-    {
-      "device_id": "...",
-      "timestamp": "...",
-      "data": [
-        { "metric_name": "...", "metric_value": 123.4, "unit": "°C", "timestamp": "..." },
-        ...
-      ]
-    }
     """
-    try:
+    with get_db_cursor() as cur:
         cur.execute(
             """
             SELECT
@@ -153,6 +171,7 @@ def get_latest_data(device_id: str):
             (device_id,)
         )
         row = cur.fetchone()
+        
         if not row:
             raise HTTPException(status_code=404, detail="No data found for device")
 
@@ -166,29 +185,14 @@ def get_latest_data(device_id: str):
             "timestamp": ts.isoformat(),
             "data": metrics
         }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/data/query")
 def query_data(data: DataQuery):
     """
     Query historical data for a device and time range from olimex_data.
-
-    Returns one flattened list of metric points:
-
-    {
-      "data": [
-        { "metric_name": "...", "metric_value": 123.4, "unit": "°C", "timestamp": "..." },
-        ...
-      ]
-    }
-
-    The frontend groups by metric_name and draws time series.
     """
-    try:
+    with get_db_cursor() as cur:
         cur.execute(
             """
             SELECT
@@ -211,14 +215,13 @@ def query_data(data: DataQuery):
 
         rows = cur.fetchall()
         all_metrics = []
+
         for row in rows:
             ts = row[0]
             values = row[1:]
             all_metrics.extend(row_to_metrics(ts, values))
 
         return {"data": all_metrics}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/")

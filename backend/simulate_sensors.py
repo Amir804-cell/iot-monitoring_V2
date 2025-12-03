@@ -12,7 +12,11 @@ import paho.mqtt.client as mqtt
 
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
-MQTT_TOPIC = "sensors/olimex"  # mqtt_ingestor listens on sensors/#
+# --- TOPIC CHANGE: Use a dedicated topic for simulated data only ---
+MQTT_TOPIC = "sensors/simulation"  # Changed from sensors/olimex to avoid conflict with real device
+
+# NOTE: The mqtt_ingestor listens on sensors/#, so this data will still be processed.
+# This topic separation allows you to easily identify and filter simulated data.
 
 
 def generate_mock_payload():
