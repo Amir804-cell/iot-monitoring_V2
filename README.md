@@ -31,7 +31,7 @@ Backend API (Data for charts):
 cd ~/iot-monitoring/backend
 uvicorn main:app --host 0.0.0.0 --port 8000
 
-Enviroment set up:
+Environment set up:
 source backend/venv/bin/activate
 
 Run py scripts:
