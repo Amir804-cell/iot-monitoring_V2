@@ -1,6 +1,9 @@
 /*
 OLIMEX ESP32-POE DV10 Ventilation → MQTT → QuestDB (TLS ENABLED)
-FIXED COMPILER ERRORS - PlatformIO READY
+PlatformIO READY
+
+This file contains the core setup() and loop() logic for the ESP32.
+It replaces the functionality of the previously suggested DV10_Controller.cpp.
 
 Commands:
 0=Off 1=Reduced 2=Normal 3=Auto
@@ -52,7 +55,7 @@ r6MVcPCBPPcsst0=
 
 )EOF";
 
-WiFiClientSecure espClient;  // ✅ CHANGED: Secure client for TLS
+WiFiClientSecure espClient;  // Secure client for TLS
 PubSubClient mqttClient(espClient);
 
 #define RX_PIN 36
