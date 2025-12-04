@@ -5,12 +5,37 @@ from pydantic import BaseModel
 from datetime import datetime
 from contextlib import contextmanager
 
+# =======================
+# LOGGING & DB CONFIGURATION
+# =======================
+import logging
+# VIGTIGT: Importer nu configure_logging som en funktion fra modulet
+from .logging_config import configure_logging, create_logging_table, OperationalError
+
+# Database connection details for QuestDB
+DB_CONFIG = {
+    "dbname": "qdb",
+    "user": "admin",
+    "password": "quest",
+    "host": "localhost", # Debian host, not container name
+    "port": 8812        # QuestDB Postgres port
+}
+
+# Kald logningskonfigurationen FØR applikationen starter
+try:
+    configure_logging(DB_CONFIG)
+except OperationalError:
+    # Loggeren er initialiseret, men QuestDB er nede, så logs er kun i konsollen.
+    logging.getLogger(__name__).error("FATAL: Logging setup failed due to initial QuestDB connection error.")
+
+logger = logging.getLogger(__name__) # Opret en logger til dette modul
+
 app = FastAPI()
 
 # CORS middleware to allow frontend access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # in production, restrict this
+    allow_origins=["*"], # in production, restrict this
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -18,7 +43,6 @@ app.add_middleware(
 
 # =======================
 # METRIC DEFINITIONS
-# (name + unit)
 # =======================
 
 METRIC_DEFS = [
@@ -48,7 +72,7 @@ class DataQuery(BaseModel):
     device_id: str
     start_time: datetime
     end_time: datetime
-    limit: int = 500  # number of rows (each row becomes many metric points)
+    limit: int = 500 # number of rows (each row becomes many metric points)
 
 
 # =======================
@@ -59,34 +83,27 @@ class DataQuery(BaseModel):
 def get_db_cursor():
     """
     Establishes a connection to QuestDB, yields the cursor, and handles
-    connection closing and error reporting. This function is now the single
-    point of connection and is easily mockable.
+    connection closing and error reporting. Used for reading/querying data.
     """
     conn = None
     cur = None
     try:
-        # >>> CHANGE HERE if your QuestDB credentials differ
-        conn = psycopg2.connect(
-            dbname="qdb",
-            user="admin",
-            password="quest",
-            host="localhost",    # Debian host, not container name
-            port=8812            # QuestDB Postgres port
-        )
+        logger.debug("Attempting to connect to QuestDB for query...")
+        conn = psycopg2.connect(**DB_CONFIG)
+        logger.debug("QuestDB connection established.")
         cur = conn.cursor()
         yield cur
-        conn.commit() # Commit transaction if successful (though reads don't strictly need it)
+        conn.commit()
     except psycopg2.OperationalError as e:
-        # Specifically catch connection failures and raise as 500 HTTPException
+        logger.error(f"Database connection failed: {str(e)}") # Log fejlen
         raise HTTPException(
             status_code=500, 
             detail=f"Database connection failed: {str(e)}"
         )
     except Exception as e:
-        # General database operation error handling (e.g., query execution failure)
+        logger.error(f"Database operation failed: {str(e)}") # Log fejlen
         if conn:
             conn.rollback()
-        # Raise generic 500 for other unexpected errors
         raise HTTPException(status_code=500, detail=f"Database operation failed: {str(e)}")
     finally:
         if cur:
@@ -95,26 +112,17 @@ def get_db_cursor():
             conn.close()
 
 # =======================
-# HELPERS
+# HELPERS & ENDPOINTS
 # =======================
 
 def row_to_metrics(ts, row_values):
     """
-    Convert a single DB row (values after ts) to a list of metric dicts
-    in the shape expected by webserver/index.html:
-
-    {
-      "metric_name": "...",
-      "metric_value": ...,
-      "unit": "...",
-      "timestamp": "ISO8601"
-    }
+    Convert a single DB row (values after ts) to a list of metric dicts.
     """
     metrics = []
     for (name, unit), value in zip(METRIC_DEFS, row_values):
         if value is None:
             continue
-        # run_mode, runtimes etc can be int; Grafana/JS like floats
         try:
             numeric_value = float(value)
         except Exception:
@@ -129,20 +137,38 @@ def row_to_metrics(ts, row_values):
     return metrics
 
 
-# =======================
-# API ENDPOINTS (Updated to use get_db_cursor context manager)
-# =======================
+@app.on_event("startup")
+async def startup_event():
+    """ Log, når serveren starter, og lav en indledende DB-forbindelse. """
+    logger.info("FastAPI server starting up...")
+    
+    # 1. Opret 'logging' tabellen FØR vi prøver at bruge loggeren
+    try:
+        create_logging_table(DB_CONFIG)
+    except OperationalError:
+        # Hvis tabellen ikke kan oprettes, vil logs kun vises i konsollen (DBHandler vil reconnecte)
+        logger.warning("QuestDB logging table creation failed. Logs will only appear in console.")
+    
+    # 2. Tjek om QuestDB er tilgængelig for queries (via get_db_cursor)
+    try:
+        with get_db_cursor():
+            logger.info("Initial QuestDB connection for queries successful.")
+    except HTTPException:
+        logger.warning("QuestDB is not immediately available for queries; endpoint retries expected.")
+    
+    logger.info("API startup tasks complete.")
+
 
 @app.get("/api/devices")
 def get_devices():
     """
     Return list of device_ids from olimex_data
-    -> { "devices": ["OLIMEX_POE", ...] }
     """
-    # Using the context manager to automatically open/close the connection
+    logger.info("Endpoint accessed: /api/devices")
     with get_db_cursor() as cur:
         cur.execute("SELECT DISTINCT device_id FROM olimex_data;")
         devices = [row[0] for row in cur.fetchall()]
+        logger.info(f"Found {len(devices)} unique devices.")
         return {"devices": devices}
 
 
@@ -151,6 +177,7 @@ def get_latest_data(device_id: str):
     """
     Return the latest row for a device, converted to a list of metrics.
     """
+    logger.info(f"Endpoint accessed: /api/data/latest/{device_id}")
     with get_db_cursor() as cur:
         cur.execute(
             """
@@ -173,6 +200,7 @@ def get_latest_data(device_id: str):
         row = cur.fetchone()
         
         if not row:
+            logger.warning(f"No data found for device: {device_id}")
             raise HTTPException(status_code=404, detail="No data found for device")
 
         ts = row[0]
@@ -192,6 +220,7 @@ def query_data(data: DataQuery):
     """
     Query historical data for a device and time range from olimex_data.
     """
+    logger.info(f"Endpoint accessed: /api/data/query for device {data.device_id}")
     with get_db_cursor() as cur:
         cur.execute(
             """
@@ -220,10 +249,12 @@ def query_data(data: DataQuery):
             ts = row[0]
             values = row[1:]
             all_metrics.extend(row_to_metrics(ts, values))
-
+        
+        logger.info(f"Query returned {len(rows)} database rows.")
         return {"data": all_metrics}
 
 
 @app.get("/")
 def root():
+    logger.info("Endpoint accessed: /")
     return {"status": "Backend running", "table": "olimex_data"}
